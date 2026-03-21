@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+.DS_Store
+logs/*.log
+openapi.json
+api_reference_full.json
