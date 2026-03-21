@@ -332,6 +332,30 @@ Module names: `MAMUT`, `AGRO_LICENCE`, `AGRO_CLIENT`, `AGRO_INVOICE`, `AGRO_WAGE
 
 ---
 
+## Timesheet
+**GET /timesheet/entry** -- Search: `dateFrom`, `dateTo`, `employeeId`, `projectId`, `activityId`
+**POST /timesheet/entry** -- Create timesheet entry (one per employee/date/activity/project)
+**GET /timesheet/entry/{id}** -- Get by ID
+**PUT /timesheet/entry/{id}** -- Update entry
+**DELETE /timesheet/entry/{id}** -- Delete entry
+**POST /timesheet/entry/list** -- Create multiple entries at once
+**PUT /timesheet/entry/list** -- Update multiple entries at once
+```json
+{
+  "employee": {"id": 1},
+  "project": {"id": 123},
+  "activity": {"id": 456},
+  "date": "2026-03-21",
+  "hours": 7.5,
+  "comment": "Development work"
+}
+```
+**GET /timesheet/entry/>recentActivities** -- Recent activities for employee (params: `projectId` required, `employeeId`)
+**GET /timesheet/entry/>recentProjects** -- Recent projects for employee
+**GET /timesheet/entry/>totalHours** -- Total hours (params: `employeeId`, `startDate`, `endDate`)
+
+---
+
 ## Norwegian Chart of Accounts (NS 4102)
 
 Account numbers follow the standard Norwegian chart. Key accounts by group:

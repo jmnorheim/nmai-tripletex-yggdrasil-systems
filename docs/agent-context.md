@@ -19,7 +19,7 @@ tripletex-nmai/
 └── logs/                 # Runtime logs (submissions.log, testing.log)
 ```
 
-## Architecture (single file: `agent.py`, ~1280 lines)
+## Architecture (single file: `agent.py`, ~2530 lines)
 
 ### Request Flow
 
@@ -47,21 +47,33 @@ POST /solve {prompt, files[], tripletex_credentials}
 
 ### Deterministic Solvers
 
-9 task types bypass the LLM loop entirely. One LLM call extracts fields, then a hardcoded function executes the exact API sequence:
+20 task types bypass the LLM loop entirely. One LLM call (Claude Sonnet, fast) extracts fields, then a hardcoded function executes the exact API sequence with parallel calls where possible:
 
-| Solver | Task | Typical Time |
-|--------|------|-------------|
-| `CREATE_DEPARTMENTS` | Create departments | ~3s |
-| `CREATE_CUSTOMER` | Create customer | ~3s |
-| `CREATE_SUPPLIER` | Create supplier | ~3s |
-| `CREATE_PRODUCT` | Create product | ~3s |
-| `CREATE_EMPLOYEE` | Create employee + employment | ~8s |
-| `CREDIT_NOTE` | Credit note for existing invoice | ~10s |
-| `CREATE_PROJECT` | Create project with PM/customer | ~8s |
-| `SIMPLE_INVOICE` | Create + send invoice | ~10s |
-| `REGISTER_PAYMENT` | Pay an existing invoice | ~10s |
+| Solver | Task | Tier |
+|--------|------|------|
+| `CREATE_DEPARTMENTS` | Create departments | T1 |
+| `CREATE_CUSTOMER` | Create customer | T1 |
+| `CREATE_SUPPLIER` | Create supplier | T1 |
+| `CREATE_PRODUCT` | Create product | T1 |
+| `CREATE_EMPLOYEE` | Create employee + employment | T1 |
+| `CREDIT_NOTE` | Credit note for existing invoice | T1 |
+| `CREATE_PROJECT` | Create project with PM/customer | T1 |
+| `SIMPLE_INVOICE` | Create + send invoice | T1 |
+| `REGISTER_PAYMENT` | Pay an existing invoice | T1 |
+| `REGISTER_SUPPLIER_INVOICE` | Supplier invoice voucher | T2 |
+| `PAYROLL_RUN` | Salary transaction | T2 |
+| `CUSTOM_DIMENSION` | Dimension + linked voucher | T2 |
+| `ORDER_INVOICE_PAYMENT` | Order → invoice → payment | T2 |
+| `REVERSE_PAYMENT` | Reverse a bank payment | T2 |
+| `TRAVEL_EXPENSE` | Travel with costs + per diem | T2 |
+| `MULTI_VAT_INVOICE` | Invoice with mixed VAT rates | T2 |
+| `FIXED_PRICE_PROJECT` | Fixed-price project + invoice | T2 |
+| `TIME_TRACKING` | Timesheet entries + invoice | T2 |
+| `FOREIGN_CURRENCY_INVOICE` | Foreign currency + agio (new invoice) | T2 |
+| `FOREIGN_CURRENCY_PAYMENT` | Payment on existing foreign invoice | T2 |
 
 Files attached → solvers skipped (fall through to LLM loop).
+Solver failure → extracted fields passed as context hint to LLM loop.
 
 ### Key Components
 
@@ -77,10 +89,10 @@ Files attached → solvers skipped (fall through to LLM loop).
 
 ### Config
 
-- **Model:** `anthropic/claude-opus-4-6` via OpenRouter (used for both LLM loop and solver extraction)
+- **Model:** `anthropic/claude-opus-4-6` via OpenRouter (LLM loop), `anthropic/claude-sonnet-4` (fast solver extraction)
 - **Max iterations:** 30
 - **Timeout:** 270s (5-min deadline minus 30s buffer)
-- **Response truncation:** 8000 chars
+- **Response truncation:** 3000 chars (compressed: only essential fields kept)
 
 ## Task Structure
 

@@ -110,6 +110,10 @@ Optimal sequence:
 GET /invoice (search by customer/description) -> PUT /invoice/{id}/:createCreditNote.
 Credit note date goes as query param `date`.
 
+**IMPORTANT:** Always search invoices with wide date ranges (`invoiceDateFrom=2020-01-01`, `invoiceDateTo=2030-12-31`). Invoice dates may be in the future -- never assume they are in past years only. The credit note `date` must be on or after the invoice's `invoiceDate` -- using an earlier date causes 422.
+
+**Deterministic solver:** `CREDIT_NOTE` — handled automatically (~3 API calls).
+
 ### TASK-15: Fixed Price Project Invoice
 **IMPORTANT:** POST /project does NOT accept `fixedPrice` or `isFixedPrice`. You MUST:
 1. POST /project (without fixedPrice fields)
@@ -187,6 +191,18 @@ Optimal sequence:
 - Look up GET /ledger/account for 8060, 1920, or 1500 -- these are handled internally by the payment endpoint
 - Fetch GET /ledger/voucher after the payment to verify the agio posting -- a 200 response confirms success
 - Use narrow fields on the initial GET /customer -- include `version,currency(id,code)` to avoid a second fetch
+- Try to pay an existing NOK invoice with foreign currency amounts -- if the existing invoice is in NOK, you must create a NEW invoice in the correct foreign currency first. Do NOT make payment attempts on a mismatched-currency invoice.
+
+### TASK-20b: Payment on Existing Foreign Currency Invoice
+When the task references an existing invoice and only asks to register payment at a different exchange rate:
+
+Optimal sequence:
+1. GET /customer (by organizationNumber) → customer ID
+2. GET /invoice/paymentType → find "Betalt til bank"
+3. GET /invoice (customerId=X, include `amountCurrency,amountCurrencyOutstanding,currency(id,code)`) → find the existing invoice
+4. PUT /invoice/{id}/:payment (`paymentDate`, `paymentTypeId`, `paidAmount` = foreign amount × payment rate in NOK, `paidAmountCurrency` = original foreign amount)
+
+**Deterministic solver:** `FOREIGN_CURRENCY_PAYMENT` — handles this automatically (~4 API calls).
 
 ## Tier 3 -- Complex (x3 multiplier)
 
@@ -236,32 +252,34 @@ Reconcile a bank statement (CSV) against open invoices. Match received payments 
 Optimal sequence:
 1. GET /ledger/voucherType (need type IDs for supplier invoice + payment vouchers)
 2. GET /invoice (find all open customer invoices -- includes customer names)
-3. GET /supplier (match supplier names to CSV entries)
+3. GET /supplier (match supplier names to CSV entries) -- if supplier not found, POST /supplier to create it. You NEED supplier IDs for all 2400 postings.
 4. GET /invoice/paymentType (need paymentTypeId for customer invoice payments)
 5. GET /ledger/account for ONLY the accounts needed in voucher postings: 1920 (bank), 2400 (AP), and any special accounts from the CSV (e.g. 8050 interest, 1950 tax bank, 7770 bank fees, 4300 purchases)
 6. PUT /invoice/{id}/:payment for each matched customer payment from the CSV
-7. POST /ledger/voucher for each supplier invoice (debit expense/purchase account, credit 2400)
-8. POST /ledger/voucher for each supplier payment (debit 2400, credit 1920)
+7. POST /ledger/voucher for each supplier invoice (debit expense/purchase account, credit 2400). **MUST include `supplier: {id: N}` on the 2400 posting.**
+8. POST /ledger/voucher for each supplier payment (debit 2400, credit 1920). **MUST include `supplier: {id: N}` on the 2400 debit posting.**
 9. POST /ledger/voucher for each misc entry (interest income, bank fees, tax transfers, etc.)
 
 ### TASK-T3-OTHER: Error Correction in Ledger
 Find erroneous vouchers/postings and post correction entries.
 
 Optimal sequence:
-1. GET /ledger/voucherType (need "Memorialbillag" or "Korreksjon" type ID)
-2. GET /ledger/voucher with `dateFrom`, `dateTo`, `fields=id,number,date,description,postings(*)` to get all vouchers in the period
-3. GET /ledger/posting filtered by the specific account IDs mentioned in the prompt (e.g. `accountId=X`) to pinpoint erroneous postings -- extract account IDs from the voucher data in step 2
-4. GET /ledger/account ONLY for accounts NOT already present in the voucher/posting data (e.g. the correct target account 6540 if only 6500 was in the data, or VAT account 2710)
-5. POST /ledger/voucher for each correction entry
+1. Batch call: GET /ledger/voucherType + GET /ledger/voucher (with `dateFrom`, `dateTo`, `fields=id,number,date,description,voucherType(id,name),postings(id,account(id,number,name),amountGross,amountGrossCurrency)`) -- this fetches ALL vouchers with full posting detail in ONE call.
+2. Analyze the response. When `count == fullResultSize`, ALL data is present -- do NOT paginate or re-fetch. Extract account IDs directly from the posting data.
+3. GET /ledger/account ONLY for accounts NOT already present in the voucher/posting data (e.g. the correct target account 7100 if only 6300 was in the data, or VAT account 2710). Skip any account whose ID you already have from step 1.
+4. POST /ledger/voucher for each correction entry. Post ALL corrections in a single iteration batch if possible.
 
-**Efficiency rules:**
-- After step 2 returns vouchers with postings, extract account IDs directly from the posting data. Do NOT re-look-up accounts whose IDs you already have (e.g. if postings show `"account": {"id": 463003680, "number": 6500}`, use ID 463003680 directly).
-- Do NOT re-fetch individual vouchers via GET /ledger/voucher/{id} after the bulk fetch -- posting search results (step 3) already provide amounts, accounts, and voucher refs needed for corrections. Corrections are new POSTs, not PUTs, so you don't need the original voucher's version.
-- Only look up accounts that are genuinely new to the correction (target accounts, VAT accounts).
+**Efficiency rules -- CRITICAL:**
+- NEVER re-fetch vouchers with different `fields`, `from`, or `count` parameters. The first GET returns all data you need if you request comprehensive fields.
+- NEVER re-fetch `/ledger/posting` for the same account with different field selections. Request `fields=id,account(id,number,name),amountGross,amountGrossCurrency,voucher(id,number,date,description),currency(id)` on the FIRST call.
+- NEVER re-fetch individual vouchers by date range after the bulk fetch -- the data is already in your context.
+- NEVER re-fetch `/ledger/voucherType` -- it's a static list, cache from the first call.
+- After step 1, you should have all account IDs, amounts, and voucher references needed. The only GETs after step 1 should be for NEW accounts (target/correction accounts not in the original data).
+- For duplicate reversal, extract BOTH sides of the original voucher's postings and reverse them (swap debit/credit signs). Do not reconstruct amounts from the prompt text alone.
 
 **Correction patterns:**
-- Wrong account (e.g. 6500 used instead of 6540): Debit correct account, Credit wrong account (reverses the error)
-- Duplicate voucher: Reverse the entire voucher (debit what was credited, credit what was debited)
+- Wrong account (e.g. 6300 used instead of 7100): Debit correct account, Credit wrong account (reverses the error)
+- Duplicate voucher: Reverse the entire voucher (debit what was credited, credit what was debited). Extract the original posting amounts exactly.
 - Missing VAT line: Debit VAT account (e.g. 2710), Credit counterpart. **CAUTION:** if crediting 2400 with vatType on a purchase account (4xxx), you MUST include `supplier: {id: N}` on the 2400 posting or it will fail with "Leverandør mangler". Use 1920 (bank) instead if no supplier exists.
 - Wrong amount: Post the difference (debit/credit to adjust to correct amount)
 
