@@ -95,8 +95,8 @@ Optimal sequence:
 5. POST /travelExpense/cost for EACH expense (flight, taxi, etc.) -- body: `{travelExpense: {id}, date, costCategory: {id}, paymentType: {id}, amountCurrencyIncVat: AMOUNT}`. Do NOT use `description`, `rate`, `count`, or `currency` fields -- they don't exist.
 6. If per diem/daily allowance:
    a. GET /travelExpense/rateCategory with `type=PER_DIEM`, `isValidDomestic=true` (for innland), `dateFrom=YYYY-01-01`, `dateTo=YYYY-12-31` matching the travel year. Pick the right category based on trip duration and overnight status.
-   b. GET /travelExpense/rate with `rateCategoryId=N` to get the system rate (use this if prompt doesn't specify a rate).
-   c. POST /travelExpense/perDiemCompensation with: `{travelExpense: {id}, rateCategory: {id}, overnightAccommodation: "HOTEL"/"NONE", location: "City", count: DAYS, rate: RATE, isDeductionForBreakfast: false}`. For DOMESTIC trips do NOT include `countryCode` (causes "Country not enabled").
+   b. GET /travelExpense/rate with `rateCategoryId=N` -- ALWAYS do this, even when the prompt specifies a custom rate. You need the `rateType` ID from the response.
+   c. POST /travelExpense/perDiemCompensation with: `{travelExpense: {id}, rateCategory: {id}, rateType: {id: RATE_TYPE_ID}, overnightAccommodation: "HOTEL"/"NONE", location: "City", count: DAYS, rate: RATE, isDeductionForBreakfast: false}`. The `rateType` field is REQUIRED -- without it, deliver will 422. For DOMESTIC trips do NOT include `countryCode` (causes "Country not enabled").
 7. PUT /travelExpense/:deliver (query: `id=N`)
 8. PUT /travelExpense/:approve (query: `id=N`)
 9. PUT /travelExpense/:createVouchers (query: `id=N`, `date=YYYY-MM-DD` -- date is REQUIRED)
@@ -280,8 +280,13 @@ Simplified year-end closing: depreciation, prepaid reversals, tax calculation.
 6. Calculate tax = 22% (or rate from prompt) × taxable result (absolute value of net_result if negative/profitable)
 7. POST /ledger/voucher for tax: Debit tax expense (e.g. 8700), Credit tax liability (e.g. 2920)
 
+**Tax on a loss -- CRITICAL:**
+- If `compute_taxable_result` returns a negative `net_result` (which means a loss in Tripletex's sign convention where negative = profit), calculate tax = 22% × abs(net_result).
+- If `net_result` is positive (meaning a loss / expenses exceed revenue), the company has NO taxable profit. Do NOT post a skattekostnad voucher -- skip the tax entry entirely. There is no income tax to pay on a loss in a simplified year-end.
+
 **Do NOT:**
 - Call GET /resultReport/result -- this endpoint does NOT exist (returns 404)
 - Fetch GET /ledger/posting to manually aggregate the result -- use `compute_taxable_result` instead
 - Try to calculate tax BEFORE posting depreciation and reversal entries (they affect the taxable result)
 - Re-fetch postings with different fields or filters -- one call via the tool is enough
+- Post a tax voucher when the taxable result shows a loss (positive net_result) -- this is wrong and will cost points

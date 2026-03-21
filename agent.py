@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import uuid
@@ -169,6 +170,9 @@ Postings to account 1500 (kundefordringer / accounts receivable) REQUIRE `custom
 ### Month-end -- NEVER fetch postings
 For month-end closing tasks, NEVER call GET /ledger/posting. It adds no value. Post your vouchers and confirm 201 responses. Use `compute_taxable_result` only if you need the taxable result for tax calculation.
 
+### Year-end tax -- skip if result is a loss
+After calling `compute_taxable_result`, check the sign of `net_result`. In Tripletex, negative = profit, positive = loss. If net_result > 0 (loss), do NOT post a skattekostnad voucher -- there is no income tax on a loss. Only post tax when net_result < 0 (profitable): tax = 22% × abs(net_result).
+
 ### Cost analysis -- NEVER use compute_taxable_result
 For tasks that require per-account breakdown (e.g. "find the 3 accounts with the biggest cost increase"), go directly to GET /ledger/posting with `fields=id,account(id,number,name),amountGross`. Do NOT call `compute_taxable_result` first -- it only returns aggregate totals and wastes a call.
 
@@ -219,6 +223,7 @@ Identify the task type from the prompt and follow the optimal API sequence:
 - POST /activity REQUIRES `activityType` -- omitting it causes 422. Use `"activityType": "PROJECT_GENERAL_ACTIVITY"` for project-related activities or `"GENERAL_ACTIVITY"` for general ones. Also include `isProjectActivity`, `isGeneral`, `isChargeable`.
 - For supplier cost vouchers (debit 4300, credit 2400), do NOT look up account 1920 -- recording a supplier cost is not a payment. Only look up accounts that appear in the voucher postings.
 - For year-end depreciation, only look up accounts used in POSTINGS (e.g. 6010, 1209, 1700, 6300, 8700, 2920). Do NOT look up asset accounts (1210, 1230, 1250, etc.) -- they are descriptive only and not used in postings.
+- POST /travelExpense/perDiemCompensation REQUIRES `rateType: {{id: N}}`. ALWAYS GET /travelExpense/rate with `rateCategoryId=N` first to get the rateType ID, even when the prompt specifies a custom rate. Without rateType, deliver will 422.
 
 ## Your Strategy
 
@@ -374,6 +379,52 @@ def _invalidate_cache(token: str, norm_path: str) -> int:
     return removed
 
 
+# ---- Endpoint Validation ---------------------------------------------------
+# Pre-load all valid (method, path) combos from the API reference so we can
+# intercept hallucinated endpoints before they hit Tripletex (saves a 4xx +
+# efficiency penalty).
+
+_ENDPOINT_PATTERNS: dict[str, list[tuple[re.Pattern, str]]] = {}
+
+
+def _build_endpoint_registry():
+    ref_path = Path(__file__).parent / "api_reference_full.json"
+    if not ref_path.exists():
+        return
+    ref = json.loads(ref_path.read_text(encoding="utf-8"))
+    for ep in ref:
+        method = ep["method"]
+        path = ep["path"]
+        parts = path.strip("/").split("/")
+        regex_parts = []
+        for part in parts:
+            if part.startswith("{") and part.endswith("}"):
+                regex_parts.append("[^/]+")
+            else:
+                regex_parts.append(re.escape(part))
+        pattern = re.compile("^/" + "/".join(regex_parts) + "$")
+        _ENDPOINT_PATTERNS.setdefault(method, []).append((pattern, path))
+
+
+_build_endpoint_registry()
+
+
+def _validate_endpoint(method: str, norm_path: str) -> str | None:
+    """Return error message if endpoint doesn't exist, None if valid."""
+    for pattern, _ in _ENDPOINT_PATTERNS.get(method, []):
+        if pattern.match(norm_path):
+            return None
+    root = norm_path.strip("/").split("/")[0]
+    candidates = sorted({
+        orig for _, orig in _ENDPOINT_PATTERNS.get(method, [])
+        if orig.strip("/").split("/")[0] == root
+    })
+    msg = f"Endpoint {method} {norm_path} does not exist in the Tripletex API."
+    if candidates:
+        msg += f" Valid {method} endpoints under /{root}: {', '.join(candidates[:8])}"
+    return msg
+
+
 # ---- Tripletex API Executor ------------------------------------------------
 
 
@@ -518,7 +569,19 @@ SIMPLE_INVOICE — Create invoice for a customer
 REGISTER_PAYMENT — Register full payment on an existing invoice
 {"task_type":"REGISTER_PAYMENT","customerName":"...","customerOrgNumber":"..."}
 
-If the task doesn't match any above (travel, payroll, vouchers, bank recon, month-end, error correction, multi-VAT, partial payment, dimensions, foreign currency, reminder fee, etc.), return:
+REGISTER_SUPPLIER_INVOICE — Register a supplier invoice (leverandørfaktura) as a voucher with VAT
+{"task_type":"REGISTER_SUPPLIER_INVOICE","supplierName":"...","supplierOrgNumber":"...","invoiceNumber":"...","amountInclVat":0.0,"expenseAccountNumber":6300,"vatRatePercent":25,"date":"YYYY-MM-DD","description":"..."}
+
+PAYROLL_RUN — Run payroll / salary transaction for an employee
+{"task_type":"PAYROLL_RUN","employeeEmail":"...","baseSalary":0.0,"bonus":0.0}
+
+CUSTOM_DIMENSION — Create a custom accounting dimension with values and post a voucher linked to one of the values
+{"task_type":"CUSTOM_DIMENSION","dimensionName":"...","dimensionValues":["Value1","Value2"],"voucherAccountNumber":7140,"voucherAmount":13750.0,"linkedDimensionValue":"Value1","creditAccountNumber":1920,"description":"..."}
+
+ORDER_INVOICE_PAYMENT — Create an order with existing products, convert to invoice, and register full payment
+{"task_type":"ORDER_INVOICE_PAYMENT","customerName":"...","customerOrgNumber":"...","products":[{"number":"8474","name":"Web Design","price":23450.0},{"number":"3064","name":"Software License","price":7800.0}]}
+
+If the task doesn't match any above (travel, vouchers, bank recon, month-end, error correction, multi-VAT, partial payment, foreign currency, reminder fee, etc.), return:
 {"task_type":"UNSUPPORTED"}
 
 Rules:
@@ -943,6 +1006,462 @@ async def _solve_register_payment(client, base_url, token, fields, log, rid):
     return pay_r["status_code"] in (200, 204)
 
 
+async def _solve_supplier_invoice(client, base_url, token, fields, log, rid):
+    org_nr = fields.get("supplierOrgNumber")
+    if not org_nr:
+        return False
+
+    sr = await execute_tripletex_call(
+        client, base_url, token, "GET", "/supplier",
+        params={"organizationNumber": org_nr, "fields": "id,name"},
+    )
+    if sr["status_code"] != 200 or not sr["body"].get("values"):
+        return False
+    supplier_id = sr["body"]["values"][0]["id"]
+    log.info(f"[{rid}] SOLVER GET /supplier -> id={supplier_id}")
+
+    vt_r = await execute_tripletex_call(
+        client, base_url, token, "GET", "/ledger/voucherType",
+        params={"fields": "id,name"},
+    )
+    if vt_r["status_code"] != 200:
+        return False
+    voucher_type_id = None
+    for vt in vt_r["body"].get("values", []):
+        if "leverandør" in vt.get("name", "").lower() and "faktura" in vt.get("name", "").lower():
+            voucher_type_id = vt["id"]
+            break
+    if voucher_type_id is None:
+        return False
+    log.info(f"[{rid}] SOLVER GET /ledger/voucherType -> id={voucher_type_id}")
+
+    vat_pct = fields.get("vatRatePercent", 25)
+    vat_r = await execute_tripletex_call(
+        client, base_url, token, "GET", "/ledger/vatType",
+    )
+    if vat_r["status_code"] != 200:
+        return False
+    input_vat_id = None
+    for vt in vat_r["body"].get("values", []):
+        pct = vt.get("percentage")
+        name = (vt.get("name") or "").lower()
+        if pct == vat_pct and ("inngående" in name or "innkjøp" in name or "innenlands" in name):
+            input_vat_id = vt["id"]
+            break
+    if input_vat_id is None:
+        return False
+    log.info(f"[{rid}] SOLVER GET /ledger/vatType -> input vat id={input_vat_id}")
+
+    expense_acct = fields.get("expenseAccountNumber", 6300)
+    acct_r = await execute_tripletex_call(
+        client, base_url, token, "GET", "/ledger/account",
+        params={"number": expense_acct, "fields": "id,number,name"},
+    )
+    if acct_r["status_code"] != 200 or not acct_r["body"].get("values"):
+        return False
+    expense_id = acct_r["body"]["values"][0]["id"]
+    log.info(f"[{rid}] SOLVER GET /ledger/account {expense_acct} -> id={expense_id}")
+
+    ap_r = await execute_tripletex_call(
+        client, base_url, token, "GET", "/ledger/account",
+        params={"number": 2400, "fields": "id,number,name"},
+    )
+    if ap_r["status_code"] != 200 or not ap_r["body"].get("values"):
+        return False
+    ap_id = ap_r["body"]["values"][0]["id"]
+    log.info(f"[{rid}] SOLVER GET /ledger/account 2400 -> id={ap_id}")
+
+    amount_incl = fields.get("amountInclVat", 0)
+    amount_excl = round(amount_incl / (1 + vat_pct / 100), 2)
+
+    inv_num = fields.get("invoiceNumber", "")
+    supplier_name = fields.get("supplierName", "")
+    desc_parts = [s for s in [f"Faktura {inv_num}" if inv_num else "", supplier_name] if s]
+    description = " - ".join(desc_parts) or "Leverandørfaktura"
+
+    voucher_date = fields.get("date") or time.strftime("%Y-%m-%d")
+
+    vr = await execute_tripletex_call(
+        client, base_url, token, "POST", "/ledger/voucher",
+        body={
+            "date": voucher_date,
+            "description": description,
+            "voucherType": {"id": voucher_type_id},
+            "postings": [
+                {
+                    "account": {"id": expense_id},
+                    "amountGross": amount_excl,
+                    "amountGrossCurrency": amount_excl,
+                    "vatType": {"id": input_vat_id},
+                },
+                {
+                    "account": {"id": ap_id},
+                    "amountGross": -amount_incl,
+                    "amountGrossCurrency": -amount_incl,
+                    "supplier": {"id": supplier_id},
+                },
+            ],
+        },
+    )
+    log.info(f"[{rid}] SOLVER POST /ledger/voucher -> {vr['status_code']}")
+    return vr["status_code"] in (200, 201)
+
+
+async def _solve_payroll(client, base_url, token, fields, log, rid):
+    email = fields.get("employeeEmail")
+    if not email:
+        return False
+
+    emp_r = await execute_tripletex_call(
+        client, base_url, token, "GET", "/employee",
+        params={
+            "email": email,
+            "fields": "id,firstName,lastName,dateOfBirth,employments(id,startDate,division(id))",
+        },
+    )
+    if emp_r["status_code"] != 200 or not emp_r["body"].get("values"):
+        return False
+    emp = emp_r["body"]["values"][0]
+    emp_id = emp["id"]
+    log.info(f"[{rid}] SOLVER GET /employee -> id={emp_id}")
+
+    if not emp.get("dateOfBirth"):
+        dob_r = await execute_tripletex_call(
+            client, base_url, token, "PUT", f"/employee/{emp_id}",
+            body={"id": emp_id, "dateOfBirth": "1990-05-15"},
+        )
+        if dob_r["status_code"] != 200:
+            return False
+        log.info(f"[{rid}] SOLVER PUT /employee dateOfBirth -> {dob_r['status_code']}")
+
+    has_employment = bool(emp.get("employments"))
+
+    if not has_employment:
+        div_r = await execute_tripletex_call(
+            client, base_url, token, "GET", "/division",
+            params={"fields": "id,name"},
+        )
+        div_vals = div_r["body"].get("values", []) if div_r["status_code"] == 200 else []
+        log.info(f"[{rid}] SOLVER GET /division -> found {len(div_vals)}")
+
+        if div_vals:
+            div_id = div_vals[0]["id"]
+        else:
+            dcr = await execute_tripletex_call(
+                client, base_url, token, "POST", "/division",
+                body={
+                    "name": "Hovedkontor", "organizationNumber": "999999999",
+                    "startDate": "2025-01-01",
+                    "municipality": {"id": 1}, "municipalityDate": "2025-01-01",
+                },
+            )
+            if dcr["status_code"] not in (200, 201):
+                return False
+            div_id = dcr["body"]["value"]["id"]
+            log.info(f"[{rid}] SOLVER POST /division -> {dcr['status_code']}")
+
+        empl_r = await execute_tripletex_call(
+            client, base_url, token, "POST", "/employee/employment",
+            body={
+                "employee": {"id": emp_id},
+                "startDate": "2025-01-01",
+                "division": {"id": div_id},
+                "employmentDetails": [{
+                    "date": "2025-01-01",
+                    "employmentType": "ORDINARY",
+                    "maritimeEmployment": {"shipRegister": "NIS", "shipType": "OTHER", "tradeArea": "DOMESTIC"},
+                    "remunerationType": "MONTHLY_WAGE",
+                    "workingHoursScheme": "NOT_SHIFT",
+                    "occupationCode": {"id": 3},
+                }],
+            },
+        )
+        if empl_r["status_code"] not in (200, 201):
+            return False
+        log.info(f"[{rid}] SOLVER POST /employee/employment -> {empl_r['status_code']}")
+
+    st_r = await execute_tripletex_call(
+        client, base_url, token, "GET", "/salary/type",
+        params={"fields": "id,number,name", "count": 100},
+    )
+    if st_r["status_code"] != 200:
+        return False
+    salary_types = st_r["body"].get("values", [])
+
+    base_type_id = None
+    bonus_type_id = None
+    for st in salary_types:
+        name_lower = (st.get("name") or "").lower()
+        num = st.get("number", "")
+        if num == "2000" or name_lower == "fastlønn":
+            base_type_id = st["id"]
+        if "bonus" in name_lower or num == "2030":
+            bonus_type_id = st["id"]
+    if base_type_id is None:
+        return False
+    log.info(f"[{rid}] SOLVER GET /salary/type -> base={base_type_id}, bonus={bonus_type_id}")
+
+    now = time.localtime()
+    month = now.tm_mon
+    year = now.tm_year
+    last_day = 28
+    for d in (31, 30, 29, 28):
+        try:
+            time.strptime(f"{year}-{month:02d}-{d:02d}", "%Y-%m-%d")
+            last_day = d
+            break
+        except ValueError:
+            continue
+
+    specs = []
+    base_salary = fields.get("baseSalary", 0)
+    if base_salary:
+        specs.append({
+            "salaryType": {"id": base_type_id},
+            "amount": base_salary,
+            "rate": base_salary,
+            "count": 1,
+        })
+
+    bonus = fields.get("bonus", 0)
+    if bonus and bonus_type_id:
+        specs.append({
+            "salaryType": {"id": bonus_type_id},
+            "amount": bonus,
+            "rate": bonus,
+            "count": 1,
+        })
+
+    if not specs:
+        return False
+
+    tx_r = await execute_tripletex_call(
+        client, base_url, token, "POST", "/salary/transaction",
+        body={
+            "date": f"{year}-{month:02d}-{last_day:02d}",
+            "year": year,
+            "month": month,
+            "payslips": [{
+                "employee": {"id": emp_id},
+                "specifications": specs,
+            }],
+        },
+    )
+    log.info(f"[{rid}] SOLVER POST /salary/transaction -> {tx_r['status_code']}")
+    return tx_r["status_code"] in (200, 201)
+
+
+async def _solve_custom_dimension(client, base_url, token, fields, log, rid):
+    dim_name = fields.get("dimensionName")
+    dim_values = fields.get("dimensionValues", [])
+    if not dim_name or not dim_values:
+        return False
+
+    dr = await execute_tripletex_call(
+        client, base_url, token, "POST", "/ledger/accountingDimensionName",
+        body={"dimensionName": dim_name},
+    )
+    if dr["status_code"] not in (200, 201):
+        return False
+    dim_index = dr["body"]["value"]["dimensionIndex"]
+    log.info(f"[{rid}] SOLVER POST /ledger/accountingDimensionName '{dim_name}' -> 201 (index={dim_index})")
+
+    value_ids = {}
+    for val in dim_values:
+        vr = await execute_tripletex_call(
+            client, base_url, token, "POST", "/ledger/accountingDimensionValue",
+            body={"displayName": val, "dimensionIndex": dim_index},
+        )
+        if vr["status_code"] not in (200, 201):
+            return False
+        value_ids[val] = vr["body"]["value"]["id"]
+        log.info(f"[{rid}] SOLVER POST /ledger/accountingDimensionValue '{val}' -> 201 id={value_ids[val]}")
+
+    voucher_acct = fields.get("voucherAccountNumber")
+    amount = fields.get("voucherAmount")
+    linked_value = fields.get("linkedDimensionValue")
+    if not all([voucher_acct, amount, linked_value]):
+        return True  # dimension created successfully, no voucher needed
+
+    linked_id = value_ids.get(linked_value)
+    if not linked_id:
+        return False
+
+    vt_r = await execute_tripletex_call(
+        client, base_url, token, "GET", "/ledger/voucherType",
+        params={"fields": "id,name"},
+    )
+    if vt_r["status_code"] != 200:
+        return False
+    voucher_type_id = None
+    for vt in vt_r["body"].get("values", []):
+        name_lower = vt.get("name", "").lower()
+        if "leverandør" in name_lower and "faktura" in name_lower:
+            voucher_type_id = vt["id"]
+            break
+    if voucher_type_id is None:
+        for vt in vt_r["body"].get("values", []):
+            if "memorial" in vt.get("name", "").lower():
+                voucher_type_id = vt["id"]
+                break
+    if voucher_type_id is None:
+        return False
+    log.info(f"[{rid}] SOLVER GET /ledger/voucherType -> id={voucher_type_id}")
+
+    acct_r = await execute_tripletex_call(
+        client, base_url, token, "GET", "/ledger/account",
+        params={"number": voucher_acct, "fields": "id,number,name"},
+    )
+    if acct_r["status_code"] != 200 or not acct_r["body"].get("values"):
+        return False
+    expense_id = acct_r["body"]["values"][0]["id"]
+    log.info(f"[{rid}] SOLVER GET /ledger/account {voucher_acct} -> id={expense_id}")
+
+    credit_acct = fields.get("creditAccountNumber", 1920)
+    cr_r = await execute_tripletex_call(
+        client, base_url, token, "GET", "/ledger/account",
+        params={"number": credit_acct, "fields": "id,number,name"},
+    )
+    if cr_r["status_code"] != 200 or not cr_r["body"].get("values"):
+        return False
+    credit_id = cr_r["body"]["values"][0]["id"]
+    log.info(f"[{rid}] SOLVER GET /ledger/account {credit_acct} -> id={credit_id}")
+
+    today = time.strftime("%Y-%m-%d")
+    dim_field = f"freeAccountingDimension{dim_index}"
+    desc = fields.get("description") or f"{acct_r['body']['values'][0].get('name', '')} - {dim_name} {linked_value}"
+
+    vr = await execute_tripletex_call(
+        client, base_url, token, "POST", "/ledger/voucher",
+        body={
+            "date": today,
+            "description": desc,
+            "voucherType": {"id": voucher_type_id},
+            "postings": [
+                {
+                    "row": 1, "date": today,
+                    "account": {"id": expense_id},
+                    "amountGross": amount,
+                    "amountGrossCurrency": amount,
+                    "currency": {"id": 1},
+                    dim_field: {"id": linked_id},
+                },
+                {
+                    "row": 2, "date": today,
+                    "account": {"id": credit_id},
+                    "amountGross": -amount,
+                    "amountGrossCurrency": -amount,
+                    "currency": {"id": 1},
+                },
+            ],
+        },
+    )
+    log.info(f"[{rid}] SOLVER POST /ledger/voucher -> {vr['status_code']}")
+    return vr["status_code"] in (200, 201)
+
+
+async def _solve_order_invoice_payment(client, base_url, token, fields, log, rid):
+    if fields.get("customerOrgNumber"):
+        cp = {"organizationNumber": fields["customerOrgNumber"], "fields": "id,name"}
+    elif fields.get("customerName"):
+        cp = {"customerName": fields["customerName"], "fields": "id,name"}
+    else:
+        return False
+
+    cr = await execute_tripletex_call(client, base_url, token, "GET", "/customer", params=cp)
+    if cr["status_code"] != 200 or not cr["body"].get("values"):
+        return False
+    cust_id = cr["body"]["values"][0]["id"]
+    log.info(f"[{rid}] SOLVER GET /customer -> id={cust_id}")
+
+    products = fields.get("products", [])
+    if not products:
+        return False
+
+    order_lines = []
+    for prod in products:
+        prod_number = prod.get("number")
+        if prod_number:
+            pr = await execute_tripletex_call(
+                client, base_url, token, "GET", "/product",
+                params={"number": prod_number, "fields": "id,name,number,priceExcludingVatCurrency,vatType(id)"},
+            )
+            if pr["status_code"] != 200 or not pr["body"].get("values"):
+                return False
+            p = pr["body"]["values"][0]
+            log.info(f"[{rid}] SOLVER GET /product '{prod_number}' -> id={p['id']}")
+            order_lines.append({
+                "product": {"id": p["id"]},
+                "count": prod.get("quantity", 1),
+                "unitPriceExcludingVatCurrency": prod.get("price") or p.get("priceExcludingVatCurrency", 0),
+                "vatType": p.get("vatType", {"id": 3}),
+            })
+        else:
+            vat_id = VAT_RATE_TO_TYPE.get(prod.get("vatRatePercent", 25), 3)
+            order_lines.append({
+                "description": prod.get("name", "Product"),
+                "count": prod.get("quantity", 1),
+                "unitPriceExcludingVatCurrency": prod.get("price", 0),
+                "vatType": {"id": vat_id},
+            })
+
+    pt_r = await execute_tripletex_call(
+        client, base_url, token, "GET", "/invoice/paymentType",
+        params={"fields": "id,description"},
+    )
+    if pt_r["status_code"] != 200 or not pt_r["body"].get("values"):
+        return False
+    pay_type_id = None
+    for pt in pt_r["body"]["values"]:
+        if "bank" in pt.get("description", "").lower():
+            pay_type_id = pt["id"]
+            break
+    if pay_type_id is None:
+        pay_type_id = pt_r["body"]["values"][0]["id"]
+    log.info(f"[{rid}] SOLVER GET /invoice/paymentType -> id={pay_type_id}")
+
+    today = time.strftime("%Y-%m-%d")
+    order_r = await execute_tripletex_call(
+        client, base_url, token, "POST", "/order",
+        body={
+            "customer": {"id": cust_id},
+            "orderDate": today,
+            "deliveryDate": today,
+            "orderLines": order_lines,
+        },
+    )
+    if order_r["status_code"] not in (200, 201):
+        return False
+    order_id = order_r["body"]["value"]["id"]
+    log.info(f"[{rid}] SOLVER POST /order -> {order_r['status_code']} id={order_id}")
+
+    inv_r = await execute_tripletex_call(
+        client, base_url, token, "POST", "/invoice",
+        body={
+            "invoiceDate": today,
+            "invoiceDueDate": today,
+            "customer": {"id": cust_id},
+            "orders": [{"id": order_id}],
+        },
+    )
+    if inv_r["status_code"] not in (200, 201):
+        return False
+    inv_id = inv_r["body"]["value"]["id"]
+    inv_amount = inv_r["body"]["value"].get("amount", 0)
+    log.info(f"[{rid}] SOLVER POST /invoice -> {inv_r['status_code']} id={inv_id} amount={inv_amount}")
+
+    pay_r = await execute_tripletex_call(
+        client, base_url, token, "PUT", f"/invoice/{inv_id}/:payment",
+        params={
+            "paymentDate": today,
+            "paymentTypeId": pay_type_id,
+            "paidAmount": inv_amount,
+        },
+    )
+    log.info(f"[{rid}] SOLVER PUT /invoice/:payment -> {pay_r['status_code']}")
+    return pay_r["status_code"] in (200, 204)
+
+
 DETERMINISTIC_SOLVERS = {
     "CREATE_DEPARTMENTS": _solve_departments,
     "CREATE_CUSTOMER": _solve_customer,
@@ -953,6 +1472,10 @@ DETERMINISTIC_SOLVERS = {
     "CREATE_PROJECT": _solve_project,
     "SIMPLE_INVOICE": _solve_simple_invoice,
     "REGISTER_PAYMENT": _solve_register_payment,
+    "REGISTER_SUPPLIER_INVOICE": _solve_supplier_invoice,
+    "PAYROLL_RUN": _solve_payroll,
+    "CUSTOM_DIMENSION": _solve_custom_dimension,
+    "ORDER_INVOICE_PAYMENT": _solve_order_invoice_payment,
 }
 
 
@@ -1155,19 +1678,29 @@ async def run_agent(
                     body = args.get("body")
 
                     norm_path = _normalize_api_path(path)
-                    cached_result = None
-                    if method == "GET":
-                        prefix = _cacheable_prefix(norm_path)
-                        if prefix:
-                            key = _cache_key(token, norm_path, params)
-                            cached_result = _api_cache.get(key)
 
-                    if cached_result is not None:
-                        result = cached_result
-                        log.info(
-                            f"[{request_id}] CACHE HIT: GET {path}"
-                            f" params={json.dumps(params, ensure_ascii=False) if params else None}"
-                        )
+                    endpoint_err = _validate_endpoint(method, norm_path)
+                    if endpoint_err:
+                        result = {"status_code": 404, "body": endpoint_err}
+                        log.info(f"[{request_id}] BLOCKED invalid endpoint: {method} {path}")
+                    elif method == "GET" and (prefix := _cacheable_prefix(norm_path)):
+                        key = _cache_key(token, norm_path, params)
+                        cached_result = _api_cache.get(key)
+                        if cached_result is not None:
+                            result = cached_result
+                            log.info(
+                                f"[{request_id}] CACHE HIT: GET {path}"
+                                f" params={json.dumps(params, ensure_ascii=False) if params else None}"
+                            )
+                        else:
+                            result = None
+                    else:
+                        result = None
+
+                    if endpoint_err:
+                        pass  # already set above
+                    elif result is not None:
+                        pass  # cache hit, already set
                     else:
                         log.info(
                             f"[{request_id}] API call: {method} {path}"
