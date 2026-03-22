@@ -65,8 +65,8 @@ So a perfect score on a Tier 2 task = 1.0 × 2 = 2.0 base score.
 Efficiency Bonus
 If your agent achieves a perfect correctness score (1.0), you receive an efficiency bonus that can up to double your tier score.
 Two factors determine the bonus:
-Call efficiency — How many API calls did your agent make compared to the best known solution for this task? Fewer calls = higher bonus.
-Error cleanliness — How many of your API calls resulted in 4xx errors (400, 404, 422, etc.)? Errors reduce the bonus. An agent that gets it right without trial-and-error is rewarded.
+Call efficiency — How many write calls (POST, PUT, DELETE, PATCH) did your agent make compared to the best known solution for this task? Fewer calls = higher bonus. GET requests are not counted — read as much as you need to understand the data.
+Error cleanliness — How many of your write calls resulted in 4xx errors (400, 404, 422, etc.)? Errors reduce the bonus. An agent that gets it right without trial-and-error is rewarded.
 
 
 
@@ -98,7 +98,7 @@ Perfect, best-in-class efficiency, zero errors
 
 
 The efficiency bonus only applies to perfect submissions. Non-perfect submissions score correctness × tier.
-Efficiency benchmarks are recalculated periodically. As teams find more efficient solutions, the bar rises for everyone. Your best score per task is recalculated against current benchmarks every 12 hours.
+Efficiency benchmarks are recalculated periodically. As teams find more efficient solutions, the bar rises for everyone. Your best score per task is recalculated against current benchmarks every 12 hours. Normalization only affects the efficiency bonus — your correctness score never decreases.
 Best Score Per Task
 Your score per task is your all-time best. Bad runs never lower your score — only improvements count.
 

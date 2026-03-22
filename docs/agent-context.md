@@ -12,32 +12,40 @@ tripletex-nmai/
 ├── api_reference.md      # Abridged Tripletex API ref (injected into system prompt)
 ├── task_reference.md     # Known task types + optimal API call sequences
 ├── api_reference_full.json  # Full endpoint list (3400+ lines)
+├── api_comparison.md     # Endpoint comparison notes
 ├── openapi.json          # Official Tripletex OpenAPI spec
 ├── requirements.txt      # Python deps: fastapi, httpx, pdfplumber, etc.
+├── submit.py             # Submission helper script
+├── run_3_submissions.py  # Batch submission runner
+├── discord_notify.py     # Discord notification helper
+├── test_solvers.py       # Solver test harness
 ├── .env                  # OPENROUTER_API_KEY + sandbox credentials
 ├── docs/                 # Competition docs (overview, scoring, sandbox, etc.)
+│   └── tripletex-api-guide.md  # Tripletex API usage guide
 └── logs/                 # Runtime logs (submissions.log, testing.log)
 ```
 
-## Architecture (single file: `agent.py`, ~2530 lines)
+## Architecture (single file: `agent.py`, ~4100 lines)
 
 ### Request Flow
 
 ```
 POST /solve {prompt, files[], tripletex_credentials}
   │
-  ├─ ensure_bank_account()          # Pre-set bank acct 1920 so invoices work
-  │
-  ├─ try_deterministic_solve()      # Fast path: 1 LLM call → fixed API sequence
-  │    ├─ _extract_fields()         # LLM classifies task + extracts structured fields
-  │    ├─ If task_type in DETERMINISTIC_SOLVERS:
-  │    │    └─ Run solver function  # Fixed API calls, no LLM loop (~5-15s)
-  │    └─ If unsupported or failed → fall through to LLM loop
-  │
   ├─ process_files()                # PDF→text, images→base64, text→UTF-8
   │
-  └─ Agent Loop (max 30 iterations, 270s timeout)
-       ├─ call_openrouter()         # Claude Opus via OpenRouter (reasoning for Tier 3)
+  ├─ try_deterministic_solve()      # Fast path: 1 LLM call → fixed API sequence
+  │    ├─ If files attached → skip (fall through to LLM loop)
+  │    ├─ _extract_fields()         # LLM classifies task + extracts structured fields
+  │    ├─ If task_type in DETERMINISTIC_SOLVERS:
+  │    │    ├─ ensure_bank_account()  # Only for tasks needing bank (conditional)
+  │    │    └─ Run solver function    # Fixed API calls, no LLM loop (~5-15s)
+  │    └─ If unsupported or failed → fall through to LLM loop
+  │
+  ├─ ensure_bank_account()          # Pre-set bank acct 1920 (before LLM fallback)
+  │
+  └─ Agent Loop (max 25 iterations, 180s timeout)
+       ├─ call_openrouter()         # Claude Sonnet via OpenRouter (reasoning for Tier 3)
        ├─ If tool_calls:
        │    ├─ tripletex_api()      # HTTP to Tripletex with Basic Auth
        │    │    └─ Response cache for static lookups (vatType, accounts, etc.)
@@ -47,7 +55,7 @@ POST /solve {prompt, files[], tripletex_credentials}
 
 ### Deterministic Solvers
 
-20 task types bypass the LLM loop entirely. One LLM call (Claude Sonnet, fast) extracts fields, then a hardcoded function executes the exact API sequence with parallel calls where possible:
+22 task types bypass the LLM loop entirely. One LLM call (Claude Sonnet, fast) extracts fields, then a hardcoded function executes the exact API sequence with parallel calls where possible:
 
 | Solver | Task | Tier |
 |--------|------|------|
@@ -71,6 +79,8 @@ POST /solve {prompt, files[], tripletex_credentials}
 | `TIME_TRACKING` | Timesheet entries + invoice | T2 |
 | `FOREIGN_CURRENCY_INVOICE` | Foreign currency + agio (new invoice) | T2 |
 | `FOREIGN_CURRENCY_PAYMENT` | Payment on existing foreign invoice | T2 |
+| `COST_ANALYSIS` | Per-account cost breakdown | T3 |
+| `LEDGER_CORRECTION` | Ledger error correction via voucher | T3 |
 
 Files attached → solvers skipped (fall through to LLM loop).
 Solver failure → extracted fields passed as context hint to LLM loop.
@@ -82,16 +92,16 @@ Solver failure → extracted fields passed as context hint to LLM loop.
 | `SYSTEM_PROMPT` | Inlines `api_reference.md` + `task_reference.md` + critical rules |
 | `SOLVER_EXTRACTION_PROMPT` | Schema for extracting structured fields from prompts |
 | `execute_tripletex_call()` | HTTP to Tripletex proxy with Basic Auth `(0, token)` |
-| `call_openrouter()` | Chat completion to Claude Opus via OpenRouter |
+| `call_openrouter()` | Chat completion to Claude Sonnet via OpenRouter |
 | `_api_cache` | Caches static GET responses (vatType, accounts, voucherType, etc.) |
 | `is_tier3_task()` | Keyword detection → enables extended reasoning for complex tasks |
 | `compute_result_from_postings()` | Fetches all postings and aggregates by account group |
 
 ### Config
 
-- **Model:** `anthropic/claude-opus-4-6` via OpenRouter (LLM loop), `anthropic/claude-sonnet-4` (fast solver extraction)
-- **Max iterations:** 30
-- **Timeout:** 270s (5-min deadline minus 30s buffer)
+- **Model:** `anthropic/claude-sonnet-4` via OpenRouter (both LLM loop and solver extraction; LLM loop model overridable via `AGENT_MODEL` env var)
+- **Max iterations:** 25
+- **Timeout:** 180s
 - **Response truncation:** 3000 chars (compressed: only essential fields kept)
 
 ## Task Structure
