@@ -296,8 +296,34 @@ Fields that do NOT exist on cost: `description`, `rate`, `count`, `currency`. Us
 ## Supplier
 **GET /supplier** -- Search: `supplierNumber`, `email`, `organizationNumber`
 **POST /supplier** -- Create supplier
+**POST /supplier/list** -- Create multiple suppliers at once (body: array of supplier objects, includes addresses)
 **GET /supplier/{id}** -- Get by ID
 **PUT /supplier/{id}** -- Update supplier
+
+---
+
+## Supplier Invoice (Leverandørfaktura)
+Register a supplier invoice via **POST /ledger/voucher** with voucherType "Leverandørfaktura". Do NOT use POST /incomingInvoice (BETA, not available).
+
+```json
+{
+  "date": "2026-03-22",
+  "description": "Faktura INV-2026-001 - SupplierName",
+  "voucherType": {"id": 456},
+  "postings": [
+    {"row": 1, "date": "2026-03-22", "account": {"id": 789}, "amountGross": 21300.0, "amountGrossCurrency": 21300.0, "currency": {"id": 1}, "vatType": {"id": 1}, "invoiceNumber": "INV-2026-001"},
+    {"row": 2, "date": "2026-03-22", "account": {"id": 2400_ID}, "amountGross": -21300.0, "amountGrossCurrency": -21300.0, "currency": {"id": 1}, "supplier": {"id": 123}, "invoiceNumber": "INV-2026-001"}
+  ]
+}
+```
+**IMPORTANT:** Always set `invoiceNumber` on BOTH postings (expense and AP) so scoring can match.
+Always include `supplier: {id: N}` on the 2400 posting.
+Use GROSS (VAT-inclusive) amounts as `amountGross`. The API auto-generates a VAT posting (row 0) to account 2710 when `vatType` is set. Do NOT manually calculate net or create separate VAT postings.
+
+**GET /supplierInvoice** -- Search: `invoiceDateFrom`* (required), `invoiceDateTo`* (required), `invoiceNumber`, `supplierId`, `voucherId`
+**GET /supplierInvoice/{id}** -- Get by ID
+**PUT /supplierInvoice/{invoiceId}/:approve** -- Approve supplier invoice
+**POST /supplierInvoice/{invoiceId}/:addPayment** -- Register payment on supplier invoice
 
 ---
 
@@ -322,8 +348,11 @@ Module names: `MAMUT`, `AGRO_LICENCE`, `AGRO_CLIENT`, `AGRO_INVOICE`, `AGRO_WAGE
 **GET /currency** -- List currencies (search: `code`)
 **GET /country** -- List countries (search: `code`). Country model fields: `id`, `name`, `displayName`, `isoAlpha2Code`, `isoAlpha3Code`, `isoNumericCode` -- NOT `code`. Use `fields=id,name,isoAlpha2Code` or `fields=*`.
 **GET /activity** -- List activities
-**POST /activity** -- Create activity. REQUIRED fields: `name`, `activityType` (one of `"PROJECT_GENERAL_ACTIVITY"` or `"GENERAL_ACTIVITY"`). Also include `isProjectActivity: true/false`, `isGeneral: true/false`, `isChargeable: true/false` as appropriate.
-**POST /activity/list** -- Create multiple activities at once (body: array of activity objects)
+**POST /activity** -- Create activity. REQUIRED fields: `name`, `activityType` (one of `"PROJECT_GENERAL_ACTIVITY"` or `"GENERAL_ACTIVITY"`). Also include `isProjectActivity: true/false`, `isGeneral: true/false`, `isChargeable: true/false` as appropriate. Do NOT include `project` field -- it does not exist on the Activity object.
+**POST /activity/list** -- Create multiple activities at once (body: array of activity objects). Each activity name MUST be unique in the batch.
+**POST /project/projectActivity** -- Link an activity to a project. Body: `{"activity": {"id": activityId}, "project": {"id": projectId}}`.
+This endpoint can also create a new project-specific activity inline and link it in the same write call: `{"project": {"id": projectId}, "activity": {"name": "Cost Reduction - Project A", "activityType": "PROJECT_SPECIFIC_ACTIVITY", "isProjectActivity": true, "isGeneral": false, "isChargeable": false}}`.
+For cost-analysis tasks, prefer this inline create+link flow over `POST /activity/list` because it saves one write and avoids global activity-name collisions. Also prefer issuing these writes sequentially; parallel `POST /project/projectActivity` calls can return `409 Duplicate entry`.
 **GET /division** -- List divisions
 **POST /division** -- Create division
 **GET /deliveryAddress** -- List delivery addresses
@@ -443,6 +472,36 @@ Account numbers follow the standard Norwegian chart. Key accounts by group:
 
 ---
 
+## Batch/List Endpoints (Save Write Calls)
+
+These endpoints accept arrays to create/update multiple items in ONE call instead of N separate calls:
+
+| Endpoint | Creates/Updates |
+|----------|----------------|
+| POST /employee/list | Multiple employees |
+| POST /customer/list | Multiple customers (with addresses) |
+| POST /supplier/list | Multiple suppliers (with addresses) |
+| POST /product/list | Multiple products |
+| POST /department/list | Multiple departments |
+| POST /division/list | Multiple divisions |
+| POST /project/list | Multiple projects |
+| POST /activity/list | Multiple activities |
+| POST /order/list | Multiple orders (with orderLines, max 100) |
+| POST /invoice/list | Multiple invoices (max 100, optional `sendToCustomer`) |
+| POST /order/orderline/list | Multiple order lines |
+| POST /timesheet/entry/list | Multiple timesheet entries |
+| POST /project/participant/list | Multiple project participants |
+| POST /ledger/account/list | Multiple accounts |
+| POST /contact/list | Multiple contacts |
+
+**Combined action endpoints** (compound write operations):
+- `PUT /order/{id}/:invoice` -- Create invoice from order + optional payment in ONE call (query params: `invoiceDate`, `paymentTypeId`, `paidAmount`)
+- `PUT /invoice/{id}/:createCreditNote` -- Create credit note + optionally send
+- `PUT /ledger/voucher/{id}/:reverse` -- Reverse voucher in one call (query: `date`)
+- `PUT /travelExpense/:approve`, `/:deliver`, `/:createVouchers` -- Accept `id` list for batch operations
+
+---
+
 ## Common Posting Patterns
 
 1. **Create entity**: POST with JSON body -> response `{"value": {"id": N, ...}}`
@@ -459,3 +518,4 @@ Account numbers follow the standard Norwegian chart. Key accounts by group:
 12. **Salary accrual**: Debit 5000 (lonn), Credit 2930 (skyldig lonn)
 13. **Depreciation**: Debit 6010-6030 (avskrivning), Credit 1200-1290 (contra asset)
 14. **Accrual reversal (1720/1700 to expense)**: Debit expense (6300 for rent), Credit 1720/1700
+15. **Supplier invoice**: Use POST /ledger/voucher with voucherType "Leverandørfaktura" and `invoiceNumber` set on BOTH postings. Do NOT use POST /incomingInvoice (BETA, returns 403).
