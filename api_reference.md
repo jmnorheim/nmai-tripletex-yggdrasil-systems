@@ -234,6 +234,7 @@ Fields that do NOT exist on cost: `description`, `rate`, `count`, `currency`. Us
 ```
 **GET /project/category** -- List project categories
 **POST /project/participant** -- Add participant: `{"project": {"id": N}, "employee": {"id": N}}`
+**POST /project/participant/list** -- Add multiple participants at once (body: array of participant objects)
 
 ---
 
@@ -322,6 +323,7 @@ Module names: `MAMUT`, `AGRO_LICENCE`, `AGRO_CLIENT`, `AGRO_INVOICE`, `AGRO_WAGE
 **GET /country** -- List countries (search: `code`). Country model fields: `id`, `name`, `displayName`, `isoAlpha2Code`, `isoAlpha3Code`, `isoNumericCode` -- NOT `code`. Use `fields=id,name,isoAlpha2Code` or `fields=*`.
 **GET /activity** -- List activities
 **POST /activity** -- Create activity. REQUIRED fields: `name`, `activityType` (one of `"PROJECT_GENERAL_ACTIVITY"` or `"GENERAL_ACTIVITY"`). Also include `isProjectActivity: true/false`, `isGeneral: true/false`, `isChargeable: true/false` as appropriate.
+**POST /activity/list** -- Create multiple activities at once (body: array of activity objects)
 **GET /division** -- List divisions
 **POST /division** -- Create division
 **GET /deliveryAddress** -- List delivery addresses

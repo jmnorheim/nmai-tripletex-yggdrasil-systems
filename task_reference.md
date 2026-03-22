@@ -70,7 +70,7 @@ Optimal sequence:
 1. GET /ledger/posting for each month (e.g. Jan + Feb) with `fields=id,account(id,number,name),amountGross` -- aggregate per expense account to find top increases
 2. GET /employee (need a project manager for internal projects -- `fields=id`, `count=1`)
 3. POST /project for each identified account (use `isInternal: true`, account name as project name)
-4. POST /activity for each project -- REQUIRES `activityType` (use `"PROJECT_GENERAL_ACTIVITY"`). Also include `name`, `isProjectActivity: true`, `isGeneral: true`, `isChargeable: false`.
+4. POST /activity/list to create ALL activities in ONE call (body: array of activity objects). Each REQUIRES `activityType` (use `"PROJECT_GENERAL_ACTIVITY"`). Also include `name`, `isProjectActivity: true`, `isGeneral: true`, `isChargeable: false`.
 
 **Do NOT** call `compute_taxable_result` -- it returns only aggregate net totals, not per-account breakdowns. Go directly to GET /ledger/posting for per-account data.
 
@@ -127,8 +127,8 @@ Only look up activity if you need to register timesheet entries. Only look up vo
 Optimal sequence:
 1. GET /customer, GET /employee (for each person), GET /supplier (if supplier cost mentioned), GET /activity (need activity ID for timesheet)
 2. POST /project -> PUT /project/{id} (if budget/fixedPrice needed)
-3. POST /project/participant (for non-manager employees)
-4. POST /timesheet/entry (for each employee's hours)
+3. POST /project/participant/list to add ALL non-manager participants in ONE call (body: array of `{project: {id}, employee: {id}}`)
+4. POST /timesheet/entry/list to create ALL timesheet entries in ONE call (body: array of entry objects)
 5. If supplier cost: GET /ledger/voucherType, GET /ledger/account for ONLY 4300 (expense) + 2400 (AP), POST /ledger/voucher (debit 4300, credit 2400). Do NOT look up 1920 -- recording a supplier cost is not a payment.
 6. POST /order (with project ref) -> POST /invoice
 

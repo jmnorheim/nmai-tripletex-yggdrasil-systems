@@ -22,11 +22,11 @@ app = FastAPI(title="Tripletex AI Agent")
 # ---- Configuration --------------------------------------------------------
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL = "anthropic/claude-opus-4-6"
+MODEL = os.getenv("AGENT_MODEL", "anthropic/claude-sonnet-4")
 SOLVER_MODEL = "anthropic/claude-sonnet-4"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MAX_ITERATIONS = 30
-SOLVE_TIMEOUT = 270
+MAX_ITERATIONS = 25
+SOLVE_TIMEOUT = 180
 RESPONSE_TRUNCATE_CHARS = 3000
 
 # ---- Logging --------------------------------------------------------------
@@ -45,11 +45,34 @@ def _make_logger(name: str, filename: str) -> logging.Logger:
     return logger
 
 
-for logfile in ("submissions.log", "testing.log"):
+for logfile in ("submissions.log", "testing.log", "network.log"):
     (LOG_DIR / logfile).write_text("", encoding="utf-8")
 
 submission_log = _make_logger("submissions", "submissions.log")
 testing_log = _make_logger("testing", "testing.log")
+network_log = _make_logger("network", "network.log")
+
+
+@app.middleware("http")
+async def log_all_requests(request: Request, call_next):
+    start = time.time()
+    method = request.method
+    path = request.url.path
+    client_ip = request.client.host if request.client else "unknown"
+    network_log.info(f">>> {method} {path} from {client_ip}")
+    try:
+        response = await call_next(request)
+        elapsed = time.time() - start
+        network_log.info(
+            f"<<< {method} {path} -> {response.status_code} ({elapsed:.1f}s)"
+        )
+        return response
+    except Exception as e:
+        elapsed = time.time() - start
+        network_log.error(
+            f"!!! {method} {path} FAILED after {elapsed:.1f}s: {type(e).__name__}: {e}"
+        )
+        raise
 
 # ---- Tool Definition ------------------------------------------------------
 
@@ -60,7 +83,8 @@ TOOLS = [
             "name": "tripletex_api",
             "description": (
                 "Make a request to the Tripletex v2 REST API. "
-                "Use this to create, read, update, or delete accounting entities."
+                "Use this to create, read, update, or delete accounting entities. "
+                "For /list batch endpoints, body should be a JSON array."
             ),
             "parameters": {
                 "type": "object",
@@ -79,8 +103,7 @@ TOOLS = [
                         "description": "Query parameters as key-value pairs",
                     },
                     "body": {
-                        "type": "object",
-                        "description": "JSON request body for POST/PUT",
+                        "description": "JSON request body for POST/PUT. Object for single entities, array for /list batch endpoints.",
                     },
                 },
                 "required": ["method", "path"],
@@ -135,6 +158,16 @@ Make ALL independent API calls in a SINGLE response. Do not make one call per tu
 For example, if you need to look up a customer AND an employee AND voucherTypes, call all three in one response.
 Every extra turn costs time and efficiency points.
 
+## CRITICAL: USE BATCH ENDPOINTS FOR MULTIPLE CREATES/UPDATES
+When creating or updating multiple entities of the same type, use the `/list` batch endpoints instead of individual calls:
+- `POST /timesheet/entry/list` -- create multiple timesheet entries in ONE call (body: array of entries)
+- `POST /project/participant/list` -- add multiple project participants in ONE call (body: array of participants)
+- `POST /order/list` -- create multiple orders in ONE call (max 100)
+- `POST /invoice/list` -- create multiple invoices in ONE call (max 100)
+- `POST /activity/list` -- create multiple activities in ONE call
+- `POST /contact/list` -- create multiple contacts in ONE call
+These batch endpoints accept an ARRAY as the request body (not wrapped in an object). Each saves (N-1) API calls.
+
 ## CRITICAL RULES (read first!)
 
 ### Voucher Posting Format -- MANDATORY
@@ -167,6 +200,12 @@ POST /project does NOT accept `fixedPrice` or `isFixedPrice`. Create the project
 ### Expense from Receipt -- credit account rules
 For expense receipts/reimbursements: Debit the expense account (e.g. 7140 for travel), Credit 2400 (leverandorgjeld). NEVER use account 2910 (requires employee ref and will fail). NEVER use 2930 or 2900.
 
+### Supplier invoice VAT -- use GROSS amount with vatType
+When posting a supplier invoice (leverandørfaktura) with VAT, use the GROSS (VAT-inclusive) amount as `amountGross` on the expense posting and include `vatType: {{"id": N}}` (25% → vatType 1, 15% → vatType 11, 12% → vatType 12). The API auto-generates a row 0 VAT posting that splits out the input VAT to account 2710. The user-provided postings MUST balance at the gross level:
+- Row 1 (expense): amountGross = +GROSS_AMOUNT, vatType = {{"id": 1}}
+- Row 2 (AP 2400): amountGross = -GROSS_AMOUNT, supplier = {{"id": N}}
+Do NOT manually calculate net amounts or create separate VAT postings -- the API handles VAT splitting automatically when vatType is set.
+
 ### Account Lookup -- no range queries
 GET /ledger/account only supports exact `number` filter. Do NOT use `numberFrom`/`numberTo` -- they return ALL 529 accounts. If an account doesn't exist (empty result), create it immediately with POST /ledger/account.
 
@@ -197,8 +236,17 @@ A 201 response IS the verification. Do NOT re-fetch created entities to confirm.
 ### Only fetch what you need
 Only look up entities the current step requires. Do NOT preemptively fetch department, project/category, voucherType, or activity unless the immediate next API call needs their IDs.
 
-### NEVER re-fetch data you already have
-When a GET request returns `count == fullResultSize`, ALL records are present. Do NOT paginate or re-fetch with different `from`/`count`. Do NOT re-fetch the same endpoint with different `fields` -- request sufficient fields the FIRST time. For `/ledger/posting`, always include `fields=id,account(id,number,name),amountGross,amountGrossCurrency,voucher(id,number,date,description),currency(id)` to avoid needing a second call. For `/ledger/voucher`, always include `fields=id,number,date,description,voucherType(id,name),postings(id,account(id,number,name),amountGross,amountGrossCurrency)` the first time. After fetching vouchers or postings, extract account IDs directly from the response data -- do NOT re-look-up accounts whose IDs you already have.
+### NEVER paginate when count == fullResultSize
+When a GET response contains `count == fullResultSize`, ALL records are already in the response. Do NOT make additional calls with `from` offsets. This is the #1 source of wasted API calls. Check these two numbers IMMEDIATELY after every list GET and STOP fetching if they match.
+
+### NEVER re-fetch accounts already in voucher/posting data
+When you fetch vouchers with `postings(id,account(id,number,name),...)`, every account used in those postings is returned WITH its ID. Extract account IDs from the response data. Only call GET /ledger/account for accounts NOT present in the data (e.g. a correction target account that wasn't in the original vouchers, or a VAT account like 2710). This typically saves 3-5 calls on error correction tasks.
+
+### Request comprehensive fields the FIRST time
+Do NOT re-fetch the same endpoint with different `fields`. For `/ledger/posting`, use `fields=id,account(id,number,name),amountGross,amountGrossCurrency,voucher(id,number,date,description),currency(id)`. For `/ledger/voucher`, use `fields=id,number,date,description,voucherType(id,name),postings(id,account(id,number,name),amountGross,amountGrossCurrency)`. One call with full fields is always better than multiple calls with partial fields.
+
+### NEVER re-fetch data from a previous iteration
+When you fetch a list (occupationCodes, vatTypes, accounts, etc.) in one iteration, extract and remember the IDs you need IMMEDIATELY. Do NOT call the same endpoint again in a later iteration with different `fields` -- you already have the data. This applies especially to `/employee/employment/occupationCode` lookups.
 
 ### Invoice search -- use wide date ranges
 When searching for invoices (GET /invoice), always use wide date ranges: `invoiceDateFrom=2020-01-01` and `invoiceDateTo=2030-12-31`. Invoice dates may be in the future. NEVER assume invoices are in past years only.
@@ -573,7 +621,7 @@ async def execute_tripletex_call(
     method: str,
     path: str,
     params: dict | None = None,
-    body: dict | None = None,
+    body: dict | list | None = None,
 ) -> dict:
     path = "/" + "/".join(p.strip() for p in path.split("/") if p.strip())
     url = f"{base_url}{path}"
@@ -801,16 +849,18 @@ async def _solve_departments(client, base_url, token, fields, log, rid):
     depts = fields.get("departments", [])
     if not depts:
         return False
-    for i, d in enumerate(depts):
-        r = await execute_tripletex_call(
-            client,
-            base_url,
-            token,
+    calls = [
+        (
             "POST",
             "/department",
-            body={"name": d["name"], "departmentNumber": str(i + 1)},
+            None,
+            {"name": d["name"], "departmentNumber": str(i + 1)},
         )
-        log.info(f"[{rid}] SOLVER POST /department '{d['name']}' -> {r['status_code']}")
+        for i, d in enumerate(depts)
+    ]
+    results = await _parallel_calls(client, base_url, token, calls)
+    for i, r in enumerate(results):
+        log.info(f"[{rid}] SOLVER POST /department '{depts[i]['name']}' -> {r['status_code']}")
         if r["status_code"] not in (200, 201):
             return False
     return True
@@ -1404,7 +1454,6 @@ async def _solve_supplier_invoice(client, base_url, token, fields, log, rid):
     ap_id = ap_r["body"]["values"][0]["id"]
 
     amount_incl = fields.get("amountInclVat", 0)
-    amount_excl = round(amount_incl / (1 + vat_pct / 100), 2)
     inv_num = fields.get("invoiceNumber", "")
     supplier_name = fields.get("supplierName", "")
     desc_parts = [
@@ -1428,8 +1477,8 @@ async def _solve_supplier_invoice(client, base_url, token, fields, log, rid):
                     "row": 1,
                     "date": voucher_date,
                     "account": {"id": expense_id},
-                    "amountGross": amount_excl,
-                    "amountGrossCurrency": amount_excl,
+                    "amountGross": amount_incl,
+                    "amountGrossCurrency": amount_incl,
                     "currency": {"id": 1},
                     "vatType": {"id": input_vat_id},
                 },
@@ -1632,19 +1681,21 @@ async def _solve_custom_dimension(client, base_url, token, fields, log, rid):
         return False
     dim_index = dr["body"]["value"]["dimensionIndex"]
 
-    value_ids = {}
-    for val in dim_values:
-        vr = await execute_tripletex_call(
-            client,
-            base_url,
-            token,
+    dim_val_calls = [
+        (
             "POST",
             "/ledger/accountingDimensionValue",
-            body={"displayName": val, "dimensionIndex": dim_index},
+            None,
+            {"displayName": val, "dimensionIndex": dim_index},
         )
+        for val in dim_values
+    ]
+    dim_val_results = await _parallel_calls(client, base_url, token, dim_val_calls)
+    value_ids = {}
+    for i, vr in enumerate(dim_val_results):
         if vr["status_code"] not in (200, 201):
             return False
-        value_ids[val] = vr["body"]["value"]["id"]
+        value_ids[dim_values[i]] = vr["body"]["value"]["id"]
 
     voucher_acct = fields.get("voucherAccountNumber")
     amount = fields.get("voucherAmount")
@@ -1784,21 +1835,29 @@ async def _solve_order_invoice_payment(client, base_url, token, fields, log, rid
     if not products:
         return False
 
-    order_lines = []
-    for prod in products:
-        prod_number = prod.get("number")
-        if prod_number:
-            pr = await execute_tripletex_call(
-                client,
-                base_url,
-                token,
+    # Batch all product lookups in parallel
+    numbered_prods = [(i, prod) for i, prod in enumerate(products) if prod.get("number")]
+    if numbered_prods:
+        prod_calls = [
+            (
                 "GET",
                 "/product",
-                params={
-                    "number": prod_number,
-                    "fields": "id,name,number,priceExcludingVatCurrency,vatType(id)",
-                },
+                {"number": prod["number"], "fields": "id,name,number,priceExcludingVatCurrency,vatType(id)"},
+                None,
             )
+            for _, prod in numbered_prods
+        ]
+        prod_results = await _parallel_calls(client, base_url, token, prod_calls)
+    else:
+        prod_results = []
+
+    order_lines = []
+    prod_result_idx = 0
+    for i, prod in enumerate(products):
+        prod_number = prod.get("number")
+        if prod_number:
+            pr = prod_results[prod_result_idx]
+            prod_result_idx += 1
             if pr["status_code"] != 200 or not pr["body"].get("values"):
                 return False
             p = pr["body"]["values"][0]
@@ -2031,6 +2090,7 @@ async def _solve_travel_expense(client, base_url, token, fields, log, rid):
             category_map["bus"] = cc["id"]
 
     expenses = fields.get("expenses", [])
+    cost_calls = []
     for exp in expenses:
         exp_type = exp.get("type", "").lower()
         cat_id = category_map.get(exp_type)
@@ -2043,20 +2103,20 @@ async def _solve_travel_expense(client, base_url, token, fields, log, rid):
         if not cat_id and cost_categories:
             cat_id = cost_categories[0]["id"]
 
-        await execute_tripletex_call(
-            client,
-            base_url,
-            token,
+        cost_calls.append((
             "POST",
             "/travelExpense/cost",
-            body={
+            None,
+            {
                 "travelExpense": {"id": te_id},
                 "date": dep_date,
                 "costCategory": {"id": cat_id},
                 "paymentType": {"id": pay_type_id},
                 "amountCurrencyIncVat": exp.get("amount", 0),
             },
-        )
+        ))
+    if cost_calls:
+        await _parallel_calls(client, base_url, token, cost_calls)
 
     per_diem = fields.get("perDiem")
     if per_diem:
@@ -2161,42 +2221,50 @@ async def _solve_multi_vat_invoice(client, base_url, token, fields, log, rid):
     if not products:
         return False
 
-    order_lines = []
-    for prod in products:
-        prod_number = prod.get("number")
-        if prod_number:
-            pr = await execute_tripletex_call(
-                client,
-                base_url,
-                token,
+    # Batch all product lookups in parallel
+    numbered_prods = [(i, prod) for i, prod in enumerate(products) if prod.get("number")]
+    if numbered_prods:
+        prod_calls = [
+            (
                 "GET",
                 "/product",
-                params={
-                    "number": prod_number,
-                    "fields": "id,name,number,priceExcludingVatCurrency,vatType(id)",
-                },
+                {"number": prod["number"], "fields": "id,name,number,priceExcludingVatCurrency,vatType(id)"},
+                None,
             )
+            for _, prod in numbered_prods
+        ]
+        prod_results = await _parallel_calls(client, base_url, token, prod_calls)
+        prod_lookup = {}
+        for idx, (orig_idx, prod) in enumerate(numbered_prods):
+            pr = prod_results[idx]
             if pr["status_code"] == 200 and pr["body"].get("values"):
-                p = pr["body"]["values"][0]
-                order_lines.append(
-                    {
-                        "product": {"id": p["id"]},
-                        "count": prod.get("quantity", 1),
-                        "unitPriceExcludingVatCurrency": prod.get("price")
-                        or p.get("priceExcludingVatCurrency", 0),
-                        "vatType": p.get("vatType", {"id": 3}),
-                    }
-                )
-                continue
-        vat_id = VAT_RATE_TO_TYPE.get(prod.get("vatRatePercent", 25), 3)
-        order_lines.append(
-            {
-                "description": prod.get("name", "Product"),
-                "count": prod.get("quantity", 1),
-                "unitPriceExcludingVatCurrency": prod.get("price", 0),
-                "vatType": {"id": vat_id},
-            }
-        )
+                prod_lookup[orig_idx] = pr["body"]["values"][0]
+    else:
+        prod_lookup = {}
+
+    order_lines = []
+    for i, prod in enumerate(products):
+        if i in prod_lookup:
+            p = prod_lookup[i]
+            order_lines.append(
+                {
+                    "product": {"id": p["id"]},
+                    "count": prod.get("quantity", 1),
+                    "unitPriceExcludingVatCurrency": prod.get("price")
+                    or p.get("priceExcludingVatCurrency", 0),
+                    "vatType": p.get("vatType", {"id": 3}),
+                }
+            )
+        else:
+            vat_id = VAT_RATE_TO_TYPE.get(prod.get("vatRatePercent", 25), 3)
+            order_lines.append(
+                {
+                    "description": prod.get("name", "Product"),
+                    "count": prod.get("quantity", 1),
+                    "unitPriceExcludingVatCurrency": prod.get("price", 0),
+                    "vatType": {"id": vat_id},
+                }
+            )
 
     today = time.strftime("%Y-%m-%d")
     order_r = await execute_tripletex_call(
@@ -2492,47 +2560,44 @@ async def _solve_time_tracking(client, base_url, token, fields, log, rid):
     proj_start = project.get("startDate", "2026-01-01")
     pm_id = (project.get("projectManager") or {}).get("id")
 
-    # Add participants + timesheet entries
+    # Add participants + timesheet entries (batched)
     today = time.strftime("%Y-%m-%d")
     entry_date = max(proj_start, today) if proj_start else today
 
-    for i, emp in enumerate(employees):
-        eid = emp_ids[i]
-        if eid != pm_id:
-            part_r = await execute_tripletex_call(
-                client,
-                base_url,
-                token,
-                "POST",
-                "/project/participant",
-                body={"project": {"id": proj_id}, "employee": {"id": eid}},
-            )
-            if part_r["status_code"] not in (200, 201):
-                log.warning(
-                    f"[{rid}] SOLVER time tracking: participant add failed {part_r['status_code']}"
-                )
+    participants = [
+        {"project": {"id": proj_id}, "employee": {"id": emp_ids[i]}}
+        for i, emp in enumerate(employees)
+        if emp_ids[i] != pm_id
+    ]
+    if participants:
+        part_r = await execute_tripletex_call(
+            client, base_url, token, "POST", "/project/participant/list",
+            body=participants,
+        )
+        if part_r["status_code"] not in (200, 201):
+            log.warning(f"[{rid}] SOLVER time tracking: batch participant add failed {part_r['status_code']}")
 
-        hours = emp.get("hours", 0)
-        if hours > 0:
-            ts_r = await execute_tripletex_call(
-                client,
-                base_url,
-                token,
-                "POST",
-                "/timesheet/entry",
-                body={
-                    "employee": {"id": eid},
-                    "project": {"id": proj_id},
-                    "activity": {"id": activity_id},
-                    "date": entry_date,
-                    "hours": hours,
-                },
+    ts_entries = [
+        {
+            "employee": {"id": emp_ids[i]},
+            "project": {"id": proj_id},
+            "activity": {"id": activity_id},
+            "date": entry_date,
+            "hours": emp.get("hours", 0),
+        }
+        for i, emp in enumerate(employees)
+        if emp.get("hours", 0) > 0
+    ]
+    if ts_entries:
+        ts_r = await execute_tripletex_call(
+            client, base_url, token, "POST", "/timesheet/entry/list",
+            body=ts_entries,
+        )
+        if ts_r["status_code"] not in (200, 201):
+            log.warning(
+                f"[{rid}] SOLVER time tracking: batch timesheet failed {ts_r['status_code']} {str(ts_r['body'])[:200]}"
             )
-            if ts_r["status_code"] not in (200, 201):
-                log.warning(
-                    f"[{rid}] SOLVER time tracking: timesheet entry failed {ts_r['status_code']} {str(ts_r['body'])[:200]}"
-                )
-                return False
+            return False
 
     # Create invoice
     total_amount = sum(e.get("hours", 0) * e.get("hourlyRate", 0) for e in employees)
@@ -2953,17 +3018,17 @@ async def call_openrouter(
         "model": MODEL,
         "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + messages,
         "tools": TOOLS,
-        "max_tokens": 8000 if use_reasoning else 4096,
+        "max_tokens": 6000 if use_reasoning else 4096,
     }
 
     if use_reasoning:
-        payload["reasoning"] = {"enabled": True, "max_tokens": 4000}
+        payload["reasoning"] = {"enabled": True, "max_tokens": 2500}
 
     response = await client.post(
         OPENROUTER_URL,
         headers=headers,
         json=payload,
-        timeout=90.0,
+        timeout=60.0,
     )
     response.raise_for_status()
     return response.json()
@@ -3271,12 +3336,42 @@ async def run_agent(
 
 @app.post("/solve")
 async def solve(request: Request, test: bool = Query(False)):
-    body = await request.json()
-    prompt = body["prompt"]
-    files = body.get("files", [])
-    credentials = body["tripletex_credentials"]
-
     log = testing_log if test else submission_log
+
+    headers_dict = dict(request.headers)
+    network_log.info(f"=== /solve REQUEST ===")
+    network_log.info(f"Headers: {json.dumps(headers_dict, ensure_ascii=False)}")
+
+    try:
+        raw_body = await request.body()
+        network_log.info(f"Raw body size: {len(raw_body)} bytes")
+        body = json.loads(raw_body)
+    except Exception as e:
+        network_log.error(f"Failed to parse request body: {type(e).__name__}: {e}")
+        network_log.error(f"Raw body (first 2000 chars): {raw_body[:2000]}")
+        log.error(f"Failed to parse request body: {type(e).__name__}: {e}")
+        return JSONResponse({"status": "error", "detail": "bad request body"}, status_code=400)
+
+    body_summary = {}
+    for k, v in body.items():
+        if k == "tripletex_credentials":
+            body_summary[k] = {kk: ("***" if "token" in kk.lower() else vv) for kk, vv in v.items()} if isinstance(v, dict) else "***"
+        elif k == "files":
+            body_summary[k] = [{"name": f.get("name", "?"), "mime_type": f.get("mime_type", "?"), "size": len(f.get("content_base64", ""))} for f in v] if isinstance(v, list) else v
+        elif k == "prompt":
+            body_summary[k] = v[:500]
+        else:
+            body_summary[k] = str(v)[:200]
+    network_log.info(f"Body: {json.dumps(body_summary, ensure_ascii=False)}")
+
+    try:
+        prompt = body["prompt"]
+        files = body.get("files", [])
+        credentials = body["tripletex_credentials"]
+    except KeyError as e:
+        network_log.error(f"Missing required field in request: {e}")
+        log.error(f"Missing required field in request: {e}")
+        return JSONResponse({"status": "error", "detail": f"missing field: {e}"}, status_code=400)
 
     try:
         await run_agent(prompt, files, credentials, log)
