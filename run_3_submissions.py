@@ -5,10 +5,6 @@ import time
 import os
 
 API_BASE = "https://api.ainm.no"
-JWT = os.getenv(
-    "AINM_TOKEN",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlYWU3NzM5Ny04YTBmLTRlYjAtYjZmOS1lNGZlNGFiYWE0MTYiLCJlbWFpbCI6Imptbm9yaGVpbUBnbWFpbC5jb20iLCJpc19hZG1pbiI6ZmFsc2UsImV4cCI6MTc3NDY1MTQ5OX0.bNhH1FCBzdPM_DDJAsyERW8EhYjDzLonBk1XTmPy1h8",
-)
 TASK_ID = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 NGROK = "https://1db2-2a05-ec0-2000-113-b909-60c-2a79-a0e1.ngrok-free.app/solve"
 

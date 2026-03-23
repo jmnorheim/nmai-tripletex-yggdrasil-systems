@@ -24,11 +24,6 @@ import discord_notify as discord
 API_BASE = "https://api.ainm.no"
 TASK_ID = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 
-JWT_TOKEN = os.getenv(
-    "AINM_TOKEN",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlYWU3NzM5Ny04YTBmLTRlYjAtYjZmOS1lNGZlNGFiYWE0MTYiLCJlbWFpbCI6Imptbm9yaGVpbUBnbWFpbC5jb20iLCJpc19hZG1pbiI6ZmFsc2UsImV4cCI6MTc3NDY1MTQ5OX0.bNhH1FCBzdPM_DDJAsyERW8EhYjDzLonBk1XTmPy1h8",
-)
-
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 TRAFFIC_LOG = LOG_DIR / "network_traffic.log"
